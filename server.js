@@ -1,272 +1,181 @@
 const express = require('express');
 const path = require('path');
-const { ZingMp3 } = require('./dist');
+const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 5555;
-const STREAM_QUALITY_FALLBACKS = ['128', '320', 'lossless', 'hls'];
+const NCT_BASE_URL = process.env.NCT_BASE_URL || 'https://graph.nhaccuatui.com';
+const SEARCH_PAGE_SIZE = Number(process.env.NCT_SEARCH_PAGE_SIZE || 10);
+
+const nctClient = axios.create({
+  baseURL: NCT_BASE_URL,
+  timeout: Number(process.env.NCT_TIMEOUT_MS || 15000),
+  headers: {
+    Accept: 'application/json, text/plain, */*',
+    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    Origin: 'https://www.nhaccuatui.com',
+    Referer: 'https://www.nhaccuatui.com/',
+  },
+});
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-function isValidStreamUrl(value) {
-  return typeof value === 'string' && /^https?:\/\//i.test(value) && value.toUpperCase() !== 'VIP';
+function toText(value) {
+  return typeof value === 'string' ? value.trim() : '';
 }
 
-function findFirstStreamUrl(value, pathParts = []) {
-  if (isValidStreamUrl(value)) {
-    return { url: value, quality: pathParts.join('.') || 'url' };
+function toNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function normalizeThumbnail(song) {
+  return (
+    toText(song?.thumbnail) ||
+    toText(song?.image) ||
+    toText(song?.coverImage) ||
+    toText(song?.avatar)
+  );
+}
+
+function pickStream(detail) {
+  const streams = Array.isArray(detail?.streamURL) ? detail.streamURL : [];
+  const usable = streams.filter((item) => {
+    const stream = toText(item?.stream);
+    return stream && /^https?:\/\//i.test(stream) && item?.status !== 0 && !item?.onlyVIP;
+  });
+
+  const preferred =
+    usable.find((item) => String(item?.type) === '128') ||
+    usable.find((item) => String(item?.type) === '320') ||
+    usable[0];
+
+  if (preferred) {
+    return {
+      streamUrl: preferred.stream,
+      quality: String(preferred.type || preferred.typeUI || ''),
+    };
   }
 
-  if (!value || typeof value !== 'object') {
+  const fallback = streams.find((item) => /^https?:\/\//i.test(toText(item?.stream)));
+  if (!fallback) {
     return null;
   }
 
-  if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i += 1) {
-      const found = findFirstStreamUrl(value[i], [...pathParts, String(i)]);
-      if (found) return found;
-    }
-    return null;
-  }
-
-  for (const key of Object.keys(value)) {
-    const found = findFirstStreamUrl(value[key], [...pathParts, key]);
-    if (found) return found;
-  }
-
-  return null;
-}
-
-function pickStreamUrl(source) {
-  if (!source || typeof source !== 'object') {
-    return null;
-  }
-
-  for (const quality of STREAM_QUALITY_FALLBACKS) {
-    const value = source[quality];
-    if (isValidStreamUrl(value)) {
-      return { url: value, quality };
-    }
-
-    if (quality === 'hls' && value && typeof value === 'object') {
-      const found = findFirstStreamUrl(value, [quality]);
-      if (found) return found;
-    }
-  }
-
-  return findFirstStreamUrl(source);
-}
-
-function logZingStreamResponse(id, response) {
-  const data = response?.data;
-  console.log('[song/stream] ZingMP3 raw response', JSON.stringify({
-    id,
-    err: response?.err,
-    msg: response?.msg,
-    timestamp: response?.timestamp,
-    available_keys: data && typeof data === 'object' ? Object.keys(data) : [],
-    data,
-  }, null, 2));
-}
-
-function getZingErrorPayload(error, fallbackMessage = 'Internal Error') {
-  const zingData = error?.response?.data;
   return {
-    error: error?.message || fallbackMessage,
-    zing_msg: zingData?.msg || zingData?.message || zingData?.error || null,
-    available_keys: zingData?.data && typeof zingData.data === 'object' ? Object.keys(zingData.data) : [],
+    streamUrl: fallback.stream,
+    quality: String(fallback.type || fallback.typeUI || ''),
   };
 }
 
-// health
-app.get('/health', (_req, res) => {
-  res.json({ ok: true });
-});
+function normalizeSong(candidate, detail, stream) {
+  const source = detail || candidate || {};
+  return {
+    title: toText(source.name) || toText(source.title) || toText(candidate?.name),
+    artist:
+      toText(source.artistName) ||
+      toText(source.artistsNames) ||
+      toText(candidate?.artistName) ||
+      toText(candidate?.artistsNames),
+    duration: toNumber(source.duration || candidate?.duration),
+    thumbnail: normalizeThumbnail(source) || normalizeThumbnail(candidate),
+    streamUrl: stream.streamUrl,
+  };
+}
 
-// basic demos
-app.get('/api/top100', async (_req, res) => {
-  try {
-    const data = await ZingMp3.getTop100();
-    res.json(data);
-  } catch (e) {
-    res.status(e?.response?.status || 500).json({ error: e?.message || 'Internal Error' });
-  }
-});
+async function searchSongs(keyword) {
+  const searchResponse = await nctClient.post('/api/v1/search/song', null, {
+    params: {
+      keyword,
+      pageindex: 1,
+      pagesize: SEARCH_PAGE_SIZE,
+      correct: false,
+    },
+  });
 
-app.get('/api/home', async (_req, res) => {
-  try {
-    const data = await ZingMp3.getHome();
-    res.json(data);
-  } catch (e) {
-    res.status(e?.response?.status || 500).json({ error: e?.message || 'Internal Error' });
-  }
-});
+  const candidates = Array.isArray(searchResponse.data?.data?.songs)
+    ? searchResponse.data.data.songs
+    : [];
+  const songs = [];
 
-// full list according to README
-app.get('/api/song', async (req, res) => {
-  try {
-    const { id } = req.query;
-    if (!id) return res.status(400).json({ error: 'Missing id' });
-    const data = await ZingMp3.getSong(String(id));
-    res.json(data);
-  } catch (e) {
-    res.status(e?.response?.status || 500).json({ error: e?.message || 'Internal Error' });
-  }
-});
-
-// redirect to stream URL for simple playback (avoid CORS)
-app.get('/api/song/stream', async (req, res) => {
-  try {
-    const { id, json } = req.query;
-    if (!id) return res.status(400).json({ error: 'Missing id' });
-    const songId = String(id);
-    const response = await ZingMp3.getSong(songId);
-    logZingStreamResponse(songId, response);
-
-    const source = response?.data;
-    const availableKeys = source && typeof source === 'object' ? Object.keys(source) : [];
-    const picked = pickStreamUrl(source);
-    if (!picked) {
-      return res.status(404).json({
-        error: 'Stream URL not found',
-        zing_msg: response?.msg || null,
-        available_keys: availableKeys,
-      });
+  for (const candidate of candidates) {
+    const key = toText(candidate?.key);
+    if (!key) {
+      continue;
     }
 
-    if (json === '1') {
-      return res.json({
-        stream_url: picked.url,
-        quality: picked.quality,
-        id: songId,
-      });
+    try {
+      const detailResponse = await nctClient.get(`/api/v1/song/detail/${encodeURIComponent(key)}`);
+      const detail = detailResponse.data?.data || {};
+      const stream = pickStream(detail) || pickStream(candidate);
+
+      if (!stream?.streamUrl) {
+        console.warn(`[NCT] No direct streamUrl, fallback to next song: ${candidate.name || key}`);
+        continue;
+      }
+
+      songs.push(normalizeSong(candidate, detail, stream));
+    } catch (error) {
+      const stream = pickStream(candidate);
+      if (stream?.streamUrl) {
+        songs.push(normalizeSong(candidate, candidate, stream));
+      } else {
+        console.warn(
+          `[NCT] Detail failed and candidate has no streamUrl, fallback to next song: ${candidate.name || key}: ${error.message}`
+        );
+      }
     }
-
-    return res.redirect(picked.url);
-  } catch (e) {
-    console.error('[song/stream] ZingMP3 request failed', e?.response?.data || e);
-    res.status(e?.response?.status || 500).json(getZingErrorPayload(e));
   }
-});
 
-app.get('/api/detail-playlist', async (req, res) => {
-  try {
-    const { id } = req.query;
-    if (!id) return res.status(400).json({ error: 'Missing id' });
-    const data = await ZingMp3.getDetailPlaylist(String(id));
-    res.json(data);
-  } catch (e) {
-    res.status(e?.response?.status || 500).json({ error: e?.message || 'Internal Error' });
-  }
-});
+  return songs;
+}
 
-app.get('/api/chart-home', async (_req, res) => {
-  try {
-    const data = await ZingMp3.getChartHome();
-    res.json(data);
-  } catch (e) {
-    res.status(e?.response?.status || 500).json({ error: e?.message || 'Internal Error' });
-  }
-});
-
-app.get('/api/newrelease-chart', async (_req, res) => {
-  try {
-    const data = await ZingMp3.getNewReleaseChart();
-    res.json(data);
-  } catch (e) {
-    res.status(e?.response?.status || 500).json({ error: e?.message || 'Internal Error' });
-  }
-});
-
-app.get('/api/info-song', async (req, res) => {
-  try {
-    const { id } = req.query;
-    if (!id) return res.status(400).json({ error: 'Missing id' });
-    const data = await ZingMp3.getInfoSong(String(id));
-    res.json(data);
-  } catch (e) {
-    res.status(e?.response?.status || 500).json({ error: e?.message || 'Internal Error' });
-  }
-});
-
-app.get('/api/artist', async (req, res) => {
-  try {
-    const { name } = req.query;
-    if (!name) return res.status(400).json({ error: 'Missing name' });
-    const data = await ZingMp3.getArtist(String(name));
-    res.json(data);
-  } catch (e) {
-    res.status(e?.response?.status || 500).json({ error: e?.message || 'Internal Error' });
-  }
-});
-
-app.get('/api/artist-songs', async (req, res) => {
-  try {
-    const { id, page = '1', count = '15' } = req.query;
-    if (!id) return res.status(400).json({ error: 'Missing id' });
-    const data = await ZingMp3.getListArtistSong(String(id), String(page), String(count));
-    res.json(data);
-  } catch (e) {
-    res.status(e?.response?.status || 500).json({ error: e?.message || 'Internal Error' });
-  }
-});
-
-app.get('/api/lyric', async (req, res) => {
-  try {
-    const { id } = req.query;
-    if (!id) return res.status(400).json({ error: 'Missing id' });
-    const data = await ZingMp3.getLyric(String(id));
-    res.json(data);
-  } catch (e) {
-    res.status(e?.response?.status || 500).json({ error: e?.message || 'Internal Error' });
-  }
+app.get('/health', (req, res) => {
+  res.json({ ok: true, source: 'nhaccuatui' });
 });
 
 app.get('/api/search', async (req, res) => {
+  const keyword = toText(req.query.q);
+  if (!keyword) {
+    return res.status(400).json({ error: 'Missing query parameter: q' });
+  }
+
   try {
-    const { q } = req.query;
-    if (!q) return res.status(400).json({ error: 'Missing q' });
-    const data = await ZingMp3.search(String(q));
-    res.json(data);
-  } catch (e) {
-    res.status(e?.response?.status || 500).json({ error: e?.message || 'Internal Error' });
+    const songs = await searchSongs(keyword);
+    res.json({
+      source: 'nhaccuatui',
+      query: keyword,
+      total: songs.length,
+      songs,
+    });
+  } catch (error) {
+    console.error('[NCT] Search failed:', error.response?.data || error.message);
+    res.status(502).json({
+      error: 'NhacCuaTui search failed',
+      detail: error.message,
+    });
   }
 });
 
-app.get('/api/list-mv', async (req, res) => {
-  try {
-    const { id, page = '1', count = '15' } = req.query;
-    if (!id) return res.status(400).json({ error: 'Missing id' });
-    const data = await ZingMp3.getListMV(String(id), String(page), String(count));
-    res.json(data);
-  } catch (e) {
-    res.status(e?.response?.status || 500).json({ error: e?.message || 'Internal Error' });
+app.get('/api/song/stream', (req, res) => {
+  const streamUrl = toText(req.query.url || req.query.streamUrl);
+  if (!streamUrl || !/^https?:\/\//i.test(streamUrl)) {
+    return res.status(400).json({
+      error: 'This NhacCuaTui version does not use encodeId. Provide ?url=<streamUrl>.',
+    });
   }
+
+  res.redirect(streamUrl);
 });
 
-app.get('/api/category-mv', async (req, res) => {
-  try {
-    const { id } = req.query;
-    if (!id) return res.status(400).json({ error: 'Missing id' });
-    const data = await ZingMp3.getCategoryMV(String(id));
-    res.json(data);
-  } catch (e) {
-    res.status(e?.response?.status || 500).json({ error: e?.message || 'Internal Error' });
-  }
-});
-
-app.get('/api/video', async (req, res) => {
-  try {
-    const { id } = req.query;
-    if (!id) return res.status(400).json({ error: 'Missing id' });
-    const data = await ZingMp3.getVideo(String(id));
-    res.json(data);
-  } catch (e) {
-    res.status(e?.response?.status || 500).json({ error: e?.message || 'Internal Error' });
-  }
+app.use((req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
+  console.log(`NhacCuaTui mp3-api listening on port ${PORT}`);
 });

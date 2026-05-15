@@ -1,20 +1,20 @@
 {
   "name": "mp3-api",
   "version": "1.0.14",
-  "description": "mp3-api",
-  "main": "dist/index.js",
-  "types": "dist",
+  "description": "NhacCuaTui direct MP3 stream API for ESP32 music playback",
+  "main": "server.js",
   "repository": {
     "type": "git",
-    "url": "https://github.com/nvhung9/mp3-api"
+    "url": "https://github.com/tangdt-ship-it/mp3-api"
   },
   "keywords": [
-    "zingmp3",
     "mp3-api",
-    "zingmp3 api",
+    "nhaccuatui",
+    "nhaccuatui api",
+    "esp32 music",
     "api"
   ],
-  "author": "mrhung9 <mrhung.io.vn>",
+  "author": "",
   "license": "ISC",
   "scripts": {
     "dev": "nodemon --watch server.js --watch public --ext js,html,css --exec node server.js",
